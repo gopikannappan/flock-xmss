@@ -66,6 +66,11 @@ links, swapped pads, wrong roots, and wrong messages are all rejected (see
 forged domain that still satisfies the R1CS is rejected too (see
 `tests/m3_blake3_sound.rs`).
 
+The public statement (per-signature roots, Merkle path bits, and the
+message-derived chain positions) is absorbed into the Fiat-Shamir transcript
+before any challenge is drawn, so every challenge depends on the exact statement
+being proved (`absorb_statement` in `src/glue.rs`).
+
 ## Layout
 
 - `src/params.rs`    parameter set (leanSig-w2 shape: 66 chains, base 4, target-sum 117, height-18 tree)

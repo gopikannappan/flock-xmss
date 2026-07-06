@@ -37,6 +37,39 @@ const SLOT_HI: usize = 3;
 const SLOT_DOMAIN: usize = 4;
 const SLOT_BY_PATH_BIT: usize = usize::MAX;
 
+/// Absorb the public statement (per-signature roots, Merkle path bits, and the
+/// message-derived chain positions) into the Fiat-Shamir transcript BEFORE any
+/// challenge is drawn. Without this, the verifier reads the path and roots as
+/// free public inputs unbound to the transcript; binding them makes every
+/// downstream challenge (commitment, wiring fold, sumcheck, PCS opening) depend
+/// on the exact statement being proved. Prover and verifier call this at the
+/// same point with identical data, so the transcripts stay aligned.
+fn absorb_statement<Ch: Challenger>(
+    ch: &mut Ch,
+    roots: &[Digest],
+    path_bits: &[[bool; TREE_HEIGHT]],
+    steps: &[[usize; V_CHAINS]],
+) {
+    let mut bytes = Vec::new();
+    for r in roots {
+        for &w in r.iter() {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    for pb in path_bits {
+        for &bit in pb.iter() {
+            bytes.push(bit as u8);
+        }
+    }
+    for st in steps {
+        for &s in st.iter() {
+            bytes.extend_from_slice(&(s as u32).to_le_bytes());
+        }
+    }
+    ch.observe_label(b"flock-xmss-statement-v0");
+    ch.observe_bytes(&bytes);
+}
+
 fn layout(k_log: usize, in_off: usize, out_off: usize) -> ChainLayout {
     ChainLayout {
         k_log,
@@ -285,6 +318,9 @@ pub fn prove_sound_raw<B: Backend, Ch: Challenger>(
     check_identity: bool,
     ch: &mut Ch,
 ) -> SoundAggregateProof {
+    // Bind the public statement to the transcript before anything is committed.
+    absorb_statement(ch, roots, path_bits, steps_per_sig);
+
     let k_log = B::k_log(setup);
     let n_log = B::m(setup) - k_log;
     let r1cs = B::r1cs(setup);
@@ -421,6 +457,9 @@ pub fn verify_sound<B: Backend, Ch: Challenger>(
     }
     let steps: Vec<[usize; V_CHAINS]> =
         msgs.iter().map(|m| crate::native::encode_message::<B>(m).0).collect();
+
+    // Bind the public statement to the transcript, matching the prover.
+    absorb_statement(ch, roots, path_bits, &steps);
 
     let r1cs = B::r1cs(setup);
     let (ab, c) = flock_prover::verifier::verify_core(
