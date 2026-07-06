@@ -1,0 +1,14 @@
+[package]
+name = "flock-xmss"
+version = "0.1.0"
+edition = "2021"
+description = "XMSS hash-based signature aggregation prover over standard hashes (SHA-256), built on Flock"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Pinned to the flock revision all our benchmarks used.
+flock-prover = { git = "https://github.com/succinctlabs/flock", rev = "4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
