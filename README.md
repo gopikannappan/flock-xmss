@@ -28,6 +28,8 @@ for SHA-256 and 6.9% for BLAKE3 (v0 vs sound, same machine, same session:
 
 ## How it works
 
+![Flock proves each hash box; the glue proves the arrows that connect them into a signature](docs/how-it-works.svg)
+
 A signature is a chain of hashes leading to one public root: Winternitz chains,
 a leaf hash, then a Merkle path. **Flock proves each hash is computed correctly.**
 On its own, Flock's batch proof does not force those hashes to connect into one
