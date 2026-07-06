@@ -76,7 +76,8 @@ forged domain that still satisfies the R1CS is rejected too (see
 - `src/glue.rs`      the wiring sumcheck that makes proofs sound (SHA-256 and BLAKE3)
 
 Flock is a pinned git dependency (a fork adding a slot-aligned BLAKE3 witness
-layout; the SHA-256 side is identical to upstream, PR pending).
+layout; the SHA-256 side is identical to upstream). The BLAKE3 layout change is
+proposed upstream in [succinctlabs/flock#16](https://github.com/succinctlabs/flock/pull/16).
 
 ## Run
 
