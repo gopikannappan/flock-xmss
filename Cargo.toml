@@ -6,6 +6,8 @@ description = "XMSS hash-based signature aggregation prover over standard hashes
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 # Pinned to the flock revision all our benchmarks used.
 flock-prover = { git = "https://github.com/succinctlabs/flock", rev = "4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a" }
 

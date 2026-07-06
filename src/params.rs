@@ -29,10 +29,8 @@ pub const W: usize = 4;
 /// fixed-position variant; = the average of a target-sum encoding).
 pub const TARGET_SUM: usize = 117;
 
-/// Per-chain verifier steps (fixed pattern summing to TARGET_SUM; the real
-/// scheme derives these from the message hash - milestone 2). 51 chains do
-/// 2 steps, 15 chains do 1 step: 51*2 + 15*1 = 117.
-pub const fn chain_steps(c: usize) -> usize { if c < 51 { 2 } else { 1 } }
+// Per-chain verifier steps are message-derived (see native::encode_message);
+// the target-sum encoding guarantees they sum to TARGET_SUM for every message.
 
 /// Merkle tree height (number of auth-path compressions). 2^13 = 8192
 /// one-time keys per public root — leanSig-scale.
@@ -54,8 +52,6 @@ mod tests {
     fn counts() {
         assert_eq!(LEAF_COMPRESSIONS, 33);
         assert_eq!(COMPRESSIONS_PER_SIG, 168);
-        let ts: usize = (0..V_CHAINS).map(chain_steps).sum();
-        assert_eq!(ts, TARGET_SUM);
-        assert!(chain_steps(0) < W && chain_steps(V_CHAINS-1) < W);
+        assert!(TARGET_SUM <= V_CHAINS * (W - 1));
     }
 }

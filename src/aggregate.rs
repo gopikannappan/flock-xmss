@@ -33,13 +33,15 @@ impl<B: Backend> Aggregator<B> {
         }
     }
 
-    pub fn prove(&self, sigs: &[Signature]) -> AggregateProof {
+    pub fn prove(&self, sigs: &[Signature], msgs: &[crate::backend::Digest]) -> AggregateProof {
         assert_eq!(sigs.len(), self.n_signatures);
+        assert_eq!(msgs.len(), self.n_signatures);
         let mut instances: Vec<B::Instance> =
             Vec::with_capacity(self.n_signatures * COMPRESSIONS_PER_SIG);
         let mut roots = Vec::with_capacity(self.n_signatures);
-        for sig in sigs {
-            let w = build_sig_witness::<B>(sig);
+        for (sig, msg) in sigs.iter().zip(msgs) {
+            let steps = crate::native::encode_message::<B>(msg).0;
+            let w = build_sig_witness::<B>(sig, &steps);
             roots.push(w.computed_root);
             instances.extend(w.instances);
         }

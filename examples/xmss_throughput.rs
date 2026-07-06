@@ -11,18 +11,15 @@ fn run<B: Backend>(k: usize, runs: usize) {
     println!("[{}] K={k} signatures, {} compressions, {runs} runs",
              B::NAME, k * COMPRESSIONS_PER_SIG);
     let keys: Vec<_> = (0..k).map(|i| keygen::<B>(0xA5A5_0000 + i as u64)).collect();
-    let sigs: Vec<_> = keys.iter().map(|kp| flock_xmss::native::Signature {
-        chain_values: kp.sig_template.chain_values,
-        auth_path: kp.sig_template.auth_path,
-        path_bits: kp.sig_template.path_bits,
-    }).collect();
+    let msgs: Vec<_> = (0..k).map(|i| flock_xmss::native::Rng(0xE7 + i as u64).digest()).collect();
+    let sigs: Vec<_> = keys.iter().zip(&msgs).map(|(kp, m)| flock_xmss::native::sign::<B>(kp, m)).collect();
     let roots: Vec<_> = keys.iter().map(|kp| kp.root).collect();
 
     let agg = Aggregator::<B>::new(k);
     let mut best = f64::INFINITY;
     for r in 0..runs {
         let t = Instant::now();
-        let proof = agg.prove(&sigs);
+        let proof = agg.prove(&sigs, &msgs);
         let dt = t.elapsed().as_secs_f64();
         best = best.min(dt);
         let ok = agg.verify(&proof, &roots);

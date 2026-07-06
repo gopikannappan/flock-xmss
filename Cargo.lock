@@ -179,7 +179,9 @@ dependencies = [
 name = "flock-xmss"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "flock-prover",
+ "serde",
 ]
 
 [[package]]

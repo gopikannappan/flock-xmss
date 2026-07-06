@@ -15,8 +15,9 @@ pub enum Wire {
     /// lo = output of instance `prev` (None = public sig value); hi = CHAIN_PAD.
     ChainStep { prev: Option<usize> },
     /// Leaf MD absorb: h = output of `prev` (None = IV); lo/hi = chain tops
-    /// produced by instances `l`, `r`.
-    LeafAbsorb { prev: Option<usize>, l: usize, r: usize },
+    /// produced by instances `l`, `r`. `None` = a 0-step chain: the revealed
+    /// signature value is absorbed directly (no producing instance).
+    LeafAbsorb { prev: Option<usize>, l: Option<usize>, r: Option<usize> },
     /// Tree node: one half is output of `child`, other is the public sibling.
     PathNode { child: usize, right: bool },
 }
@@ -34,8 +35,8 @@ pub struct SigWitness<B: Backend> {
 }
 
 /// Enumerate every compression the verifier performs, recording values AND
-/// wiring. Pure function of (signature, params, backend).
-pub fn build_sig_witness<B: Backend>(sig: &Signature) -> SigWitness<B> {
+/// wiring. Pure function of (signature, message-derived steps, backend).
+pub fn build_sig_witness<B: Backend>(sig: &Signature, steps: &[usize; V_CHAINS]) -> SigWitness<B> {
     let mut triples: Vec<Triple> = Vec::with_capacity(COMPRESSIONS_PER_SIG);
     let mut wires: Vec<Wire> = Vec::with_capacity(COMPRESSIONS_PER_SIG);
     let iv = B::iv();
@@ -45,19 +46,19 @@ pub fn build_sig_witness<B: Backend>(sig: &Signature) -> SigWitness<B> {
         B::compress(&h, &lo, &hi)
     };
 
-    // --- 1. Winternitz chains ---
-    let mut top_idx = [0usize; V_CHAINS];
+    // --- 1. Winternitz chains (message-derived step counts) ---
+    let mut top_idx = [None; V_CHAINS]; // producing instance, None for 0-step chains
     let mut top_val = [[0u32; 8]; V_CHAINS];
     for c in 0..V_CHAINS {
         let mut x = sig.chain_values[c];
-        for s in 0..chain_steps(c) {
+        for s in 0..steps[c] {
             let out = push(&mut triples, iv, x, CHAIN_PAD);
             wires.push(Wire::ChainStep {
                 prev: if s == 0 { None } else { Some(triples.len() - 2) },
             });
             x = out;
         }
-        top_idx[c] = triples.len() - 1;
+        top_idx[c] = if steps[c] > 0 { Some(triples.len() - 1) } else { None };
         top_val[c] = x;
     }
 
@@ -113,8 +114,8 @@ pub fn replay_and_check<B: Backend>(w: &SigWitness<B>) -> Digest {
                     None => assert_eq!(*h, iv),
                     Some(p) => assert_eq!(*h, outs[p], "leaf MD link {i} broken"),
                 }
-                assert_eq!(*lo, outs[l], "leaf left top {i} broken");
-                assert_eq!(*hi, outs[r], "leaf right top {i} broken");
+                if let Some(l) = l { assert_eq!(*lo, outs[l], "leaf left top {i} broken"); }
+                if let Some(r) = r { assert_eq!(*hi, outs[r], "leaf right top {i} broken"); }
             }
             Wire::PathNode { child, right } => {
                 assert_eq!(*h, iv);

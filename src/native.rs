@@ -48,6 +48,34 @@ impl Rng {
     }
 }
 
+/// Message encoding: derive per-chain verifier step counts from the message
+/// via target-sum rejection sampling (the leanSig "aborting" encoding pattern).
+/// Chunk c_i in [0, W) is read from an expansion digest of (msg, counter);
+/// steps s_i = (W-1) - c_i; accept when sum(s_i) == TARGET_SUM.
+/// Returns (steps, counter). Deterministic in msg.
+pub fn encode_message<B: Backend>(msg: &Digest) -> ([usize; V_CHAINS], u32) {
+    const DOMAIN: [u32; 7] = [0x6c65_616e, 0x2d78_6d73, 0x732d_656e, 0x636f_6465,
+                              0x0000_0002, 0x0000_0002, 0x0000_0002];
+    for ctr in 0u32..1_000_000 {
+        let mut m = [0u32; 16];
+        m[..8].copy_from_slice(msg);
+        m[8] = ctr;
+        m[9..].copy_from_slice(&DOMAIN);
+        let d = B::compress(&B::iv(), &m[..8].try_into().unwrap(), &m[8..].try_into().unwrap());
+        let mut steps = [0usize; V_CHAINS];
+        let mut sum = 0usize;
+        for (i, s) in steps.iter_mut().enumerate() {
+            let chunk = ((d[i / 16] >> (2 * (i % 16))) & 3) as usize;
+            *s = (W - 1) - chunk;
+            sum += *s;
+        }
+        if sum == TARGET_SUM {
+            return (steps, ctr);
+        }
+    }
+    panic!("target-sum encoding did not converge (astronomically unlikely)");
+}
+
 /// A signature plus everything the verifier needs.
 pub struct Signature {
     /// Revealed chain values (position `W-1-chain_steps(i)` of each chain).
@@ -61,7 +89,8 @@ pub struct Signature {
 pub struct Keypair {
     pub secrets: [Digest; V_CHAINS],
     pub root: Digest,
-    pub sig_template: Signature,
+    pub auth_path: [Digest; TREE_HEIGHT],
+    pub path_bits: [bool; TREE_HEIGHT],
 }
 
 /// Deterministic keygen for ONE one-time key + its auth path (siblings are
@@ -94,28 +123,30 @@ pub fn keygen<B: Backend>(seed: u64) -> Keypair {
         };
     }
 
-    // Reveal position W-1-chain_steps(i) of each chain.
+    Keypair { secrets, root: node, auth_path, path_bits }
+}
+
+/// Sign a message: reveal each chain at its message-derived position.
+pub fn sign<B: Backend>(kp: &Keypair, msg: &Digest) -> Signature {
+    let (steps, _ctr) = encode_message::<B>(msg);
     let chain_values: [Digest; V_CHAINS] = core::array::from_fn(|i| {
-        let mut x = secrets[i];
-        for _ in 0..(W - 1 - chain_steps(i)) {
+        let mut x = kp.secrets[i];
+        for _ in 0..(W - 1 - steps[i]) {
             x = chain_step::<B>(&x);
         }
         x
     });
-
-    Keypair {
-        secrets,
-        root: node,
-        sig_template: Signature { chain_values, auth_path, path_bits },
-    }
+    Signature { chain_values, auth_path: kp.auth_path, path_bits: kp.path_bits }
 }
 
-/// Reference verification: walk chains -> leaf -> path; compare to root.
-pub fn verify<B: Backend>(sig: &Signature, root: &Digest) -> bool {
+/// Reference verification: derive steps from the message, walk chains ->
+/// leaf -> path; compare to root.
+pub fn verify<B: Backend>(sig: &Signature, msg: &Digest, root: &Digest) -> bool {
+    let (steps, _ctr) = encode_message::<B>(msg);
     let mut tops = [[0u32; 8]; V_CHAINS];
     for (i, v) in sig.chain_values.iter().enumerate() {
         let mut x = *v;
-        for _ in 0..chain_steps(i) {
+        for _ in 0..steps[i] {
             x = chain_step::<B>(&x);
         }
         tops[i] = x;

@@ -80,15 +80,16 @@ enum Eq {
     Root { xi: usize, sig: usize },
 }
 
-/// Deterministic wiring for K signatures (mirrors witness::build_sig_witness).
-fn wiring(k_sigs: usize) -> Vec<Eq> {
+/// Deterministic wiring for K signatures, driven by the message-derived
+/// per-chain step counts (mirrors witness::build_sig_witness).
+fn wiring(steps_per_sig: &[[usize; V_CHAINS]]) -> Vec<Eq> {
     let mut eqs = Vec::new();
-    for sig in 0..k_sigs {
+    for (sig, steps) in steps_per_sig.iter().enumerate() {
         let base = sig * COMPRESSIONS_PER_SIG;
         let mut idx = base;
-        let mut top_idx = [0usize; V_CHAINS];
+        let mut top_idx = [None; V_CHAINS];
         for c in 0..V_CHAINS {
-            for s in 0..chain_steps(c) {
+            for s in 0..steps[c] {
                 if s > 0 {
                     eqs.push(Eq::Link { xs: SLOT_LO, xi: idx, ys: SLOT_OUT, yi: idx - 1 });
                 }
@@ -96,7 +97,7 @@ fn wiring(k_sigs: usize) -> Vec<Eq> {
                 eqs.push(Eq::Pin { xs: SLOT_H, xi: idx, konst: 0 });
                 idx += 1;
             }
-            top_idx[c] = idx - 1;
+            top_idx[c] = if steps[c] > 0 { Some(idx - 1) } else { None };
         }
         for j in 0..LEAF_COMPRESSIONS {
             if j == 0 {
@@ -104,8 +105,12 @@ fn wiring(k_sigs: usize) -> Vec<Eq> {
             } else {
                 eqs.push(Eq::Link { xs: SLOT_H, xi: idx, ys: SLOT_OUT, yi: idx - 1 });
             }
-            eqs.push(Eq::Link { xs: SLOT_LO, xi: idx, ys: SLOT_OUT, yi: top_idx[2 * j] });
-            eqs.push(Eq::Link { xs: SLOT_HI, xi: idx, ys: SLOT_OUT, yi: top_idx[2 * j + 1] });
+            if let Some(t) = top_idx[2 * j] {
+                eqs.push(Eq::Link { xs: SLOT_LO, xi: idx, ys: SLOT_OUT, yi: t });
+            }
+            if let Some(t) = top_idx[2 * j + 1] {
+                eqs.push(Eq::Link { xs: SLOT_HI, xi: idx, ys: SLOT_OUT, yi: t });
+            }
             idx += 1;
         }
         for _l in 0..TREE_HEIGHT {
@@ -166,6 +171,7 @@ fn build_w(
 // Paired-fold degree-2 sumcheck (explicit tables W, G; LSB-first rounds)
 // ---------------------------------------------------------------------------
 
+#[derive(serde::Serialize)]
 pub struct WiringProof {
     pub rounds: Vec<(F128, F128)>, // (q(1), q(inf)) per round
     pub g_at_point: F128,
@@ -241,11 +247,12 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 // Sound aggregation (SHA-256, BaseFold mixed opening)
 // ---------------------------------------------------------------------------
 
+#[derive(serde::Serialize)]
 pub struct SoundAggregateProof {
     pub zerocheck: flock_prover::zerocheck::ZerocheckProof,
     pub lincheck: flock_prover::lincheck::LincheckProof,
     pub wiring: WiringProof,
-    pub pcs_open: flock_prover::pcs::BatchOpeningProof,
+    pub pcs_open: flock_prover::pcs::BatchOpeningProofLigerito,
     pub commitment: Commitment,
     pub n_signatures: usize,
 }
@@ -255,17 +262,23 @@ pub struct SoundAggregateProof {
 pub fn prove_sound<Ch: Challenger>(
     setup: &Sha256HybridSetup,
     sigs: &[Signature],
+    msgs: &[Digest],
     ch: &mut Ch,
 ) -> SoundAggregateProof {
+    assert_eq!(sigs.len(), msgs.len());
+    let steps: Vec<[usize; V_CHAINS]> = msgs
+        .iter()
+        .map(|m| crate::native::encode_message::<Sha256Backend>(m).0)
+        .collect();
     let mut instances = Vec::with_capacity(sigs.len() * COMPRESSIONS_PER_SIG);
     let mut roots = Vec::with_capacity(sigs.len());
-    for sig in sigs {
-        let w = build_sig_witness::<Sha256Backend>(sig);
+    for (sig, st) in sigs.iter().zip(&steps) {
+        let w = build_sig_witness::<Sha256Backend>(sig, st);
         roots.push(w.computed_root);
         instances.extend(w.instances);
     }
     let bits: Vec<[bool; TREE_HEIGHT]> = sigs.iter().map(|s| s.path_bits).collect();
-    prove_sound_raw(setup, instances, &roots, &bits, true, ch)
+    prove_sound_raw(setup, instances, &steps, &roots, &bits, true, ch)
 }
 
 /// Raw prover over pre-built instances. `check_identity=false` lets tests
@@ -274,6 +287,7 @@ pub fn prove_sound<Ch: Challenger>(
 pub fn prove_sound_raw<Ch: Challenger>(
     setup: &Sha256HybridSetup,
     instances: Vec<([u32; 8], [u32; 16])>,
+    steps_per_sig: &[[usize; V_CHAINS]],
     roots: &[Digest],
     path_bits: &[[bool; TREE_HEIGHT]],
     check_identity: bool,
@@ -310,7 +324,7 @@ pub fn prove_sound_raw<Ch: Challenger>(
     let pad_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&CHAIN_PAD));
     let root_folds: Vec<F128> =
         roots.iter().map(|r| fold_a.fold_public_phys(&cv_to_phys_bits(r))).collect();
-    let eqs = wiring(k_sigs);
+    let eqs = wiring(steps_per_sig);
     let pb = |sig: usize, lvl: usize| path_bits[sig][lvl];
     let (w4, rhs) = build_w(&eqs, rho, n_log, iv_fold, pad_fold, &root_folds, &pb);
 
@@ -350,14 +364,22 @@ pub fn prove_sound_raw<Ch: Challenger>(
     let c_x = x_outer_full(&core.c.point);
     let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
-    let pcs_open = flock_prover::pcs::open_batch_mixed_with_precomputed_s_hat_v(
-        &core.z_packed,
+    let log_n = setup.r1cs.m - flock_prover::pcs::LOG_PACKING;
+    let lig_config = flock_prover::pcs::ligerito::prover_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("ligerito prover config");
+    let pcs_open = flock_prover::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        core.z_packed,
         &core.prover_data,
         &core.commitment,
         &[ab_x.as_slice(), c_x.as_slice()],
         &[pre_ab, pre_c],
         std::slice::from_ref(&extra),
         &padding,
+        &lig_config,
         ch,
     );
 
@@ -375,14 +397,21 @@ pub fn prove_sound_raw<Ch: Challenger>(
 pub fn verify_sound<Ch: Challenger>(
     setup: &Sha256HybridSetup,
     proof: &SoundAggregateProof,
+    msgs: &[Digest],
     roots: &[Digest],
     path_bits: &[[bool; TREE_HEIGHT]],
     ch: &mut Ch,
 ) -> Result<(), String> {
     let k_sigs = proof.n_signatures;
-    if roots.len() != k_sigs || path_bits.len() != k_sigs {
+    if msgs.len() != k_sigs || roots.len() != k_sigs || path_bits.len() != k_sigs {
         return Err("statement length mismatch".into());
     }
+    // Derive per-chain step counts from the PUBLIC messages — this is what
+    // binds the aggregate to the messages: wrong message => wrong wiring.
+    let steps: Vec<[usize; V_CHAINS]> = msgs
+        .iter()
+        .map(|m| crate::native::encode_message::<Sha256Backend>(m).0)
+        .collect();
     let (ab, c) = flock_prover::verifier::verify_core(
         &setup.r1cs,
         &proof.zerocheck,
@@ -404,7 +433,7 @@ pub fn verify_sound<Ch: Challenger>(
     let pad_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&CHAIN_PAD));
     let root_folds: Vec<F128> =
         roots.iter().map(|r| fold_a.fold_public_phys(&cv_to_phys_bits(r))).collect();
-    let eqs = wiring(k_sigs);
+    let eqs = wiring(&steps);
     let pb = |sig: usize, lvl: usize| path_bits[sig][lvl];
     let (w4, rhs) = build_w(&eqs, rho, n_log, iv_fold, pad_fold, &root_folds, &pb);
 
@@ -429,13 +458,21 @@ pub fn verify_sound<Ch: Challenger>(
         point: &claim_pt,
         value: proof.wiring.g_at_point,
     };
-    flock_prover::pcs::verify_opening_batch_mixed(
+    let log_n = setup.r1cs.m - flock_prover::pcs::LOG_PACKING;
+    let v_config = flock_prover::pcs::ligerito::verifier_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("ligerito verifier config");
+    flock_prover::pcs::verify_opening_batch_ligerito_mixed(
         &proof.commitment,
         &[ab.value, c.value],
         &[ab.point.z_skip, c.point.z_skip],
         &[ab_x.as_slice(), c_x.as_slice()],
         std::slice::from_ref(&pd),
         &proof.pcs_open,
+        &v_config,
         ch,
     )
     .map_err(|e| format!("pcs: {e:?}"))
