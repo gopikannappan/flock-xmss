@@ -22,6 +22,9 @@ pub trait Backend {
     fn instance(h: &Digest, lo: &Digest, hi: &Digest) -> Self::Instance;
 
     fn setup(n_compressions: usize) -> Self::Setup;
+    /// Setup at the conservative 120-bit `Secure` Ligerito profile (unique
+    /// decoding, rate 1/2) instead of the default 100-bit `Fast` profile.
+    fn setup_secure(n_compressions: usize) -> Self::Setup;
     fn prove<Ch: Challenger>(
         setup: &Self::Setup,
         instances: &[Self::Instance],
@@ -95,6 +98,12 @@ impl Backend for Sha256Backend {
     fn setup(n: usize) -> Self::Setup {
         flock_prover::r1cs_hashes::sha2::Sha256HybridSetup::new(n)
     }
+    fn setup_secure(n: usize) -> Self::Setup {
+        flock_prover::r1cs_hashes::sha2::Sha256HybridSetup::with_profile(
+            n,
+            flock_prover::pcs::ligerito::LigeritoProfile::Secure,
+        )
+    }
     fn prove<Ch: Challenger>(
         s: &Self::Setup,
         inst: &[Self::Instance],
@@ -163,6 +172,12 @@ impl Backend for Blake3Backend {
     }
     fn setup(n: usize) -> Self::Setup {
         flock_prover::r1cs_hashes::blake3::Blake3Setup::new(n)
+    }
+    fn setup_secure(n: usize) -> Self::Setup {
+        flock_prover::r1cs_hashes::blake3::Blake3Setup::with_profile(
+            n,
+            flock_prover::pcs::ligerito::LigeritoProfile::Secure,
+        )
     }
     fn prove<Ch: Challenger>(
         s: &Self::Setup,

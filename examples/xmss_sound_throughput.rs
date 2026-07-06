@@ -8,15 +8,17 @@ use flock_xmss::glue::{prove_sound, verify_sound};
 use flock_xmss::native::{keygen, sign, Rng};
 use flock_xmss::params::COMPRESSIONS_PER_SIG;
 
-fn bench<B: Backend>(k: usize, runs: usize) {
-    println!("[sound/{}] K={k}, {} compressions, {runs} runs", B::NAME, k * COMPRESSIONS_PER_SIG);
+fn bench<B: Backend>(k: usize, runs: usize, secure: bool) {
+    let sec = if secure { "120-bit/Secure" } else { "100-bit/Fast" };
+    println!("[sound/{}] K={k}, {} compressions, {runs} runs, {sec}", B::NAME, k * COMPRESSIONS_PER_SIG);
     let keys: Vec<_> = (0..k).map(|i| keygen::<B>(0xF00D + i as u64)).collect();
     let msgs: Vec<_> = (0..k).map(|i| Rng(0xE7 + i as u64).digest()).collect();
     let sigs: Vec<_> = keys.iter().zip(&msgs).map(|(kp, m)| sign::<B>(kp, m)).collect();
     let roots: Vec<_> = keys.iter().map(|kp| kp.root).collect();
     let bits: Vec<_> = sigs.iter().map(|s| s.path_bits).collect();
 
-    let setup = B::setup(k * COMPRESSIONS_PER_SIG);
+    let n = k * COMPRESSIONS_PER_SIG;
+    let setup = if secure { B::setup_secure(n) } else { B::setup(n) };
     let mut best = f64::INFINITY;
     for r in 0..runs {
         let t = Instant::now();
@@ -39,8 +41,9 @@ fn main() {
     let k: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(390);
     let runs: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
     let hash = std::env::args().nth(3).unwrap_or_else(|| "sha256".into());
+    let secure = std::env::args().nth(4).map(|s| s == "secure").unwrap_or(false);
     match hash.as_str() {
-        "blake3" => bench::<Blake3Backend>(k, runs),
-        _ => bench::<Sha256Backend>(k, runs),
+        "blake3" => bench::<Blake3Backend>(k, runs, secure),
+        _ => bench::<Sha256Backend>(k, runs, secure),
     }
 }

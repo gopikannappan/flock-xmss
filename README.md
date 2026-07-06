@@ -26,6 +26,14 @@ encoder cuts it to roughly 2 ms). The soundness glue costs 2.0% of prover time
 for SHA-256 and 6.9% for BLAKE3 (v0 vs sound, same machine, same session:
 982 -> 962 and 1,987 -> 1,849).
 
+**Security level.** The numbers above use Flock's default `Fast` Ligerito
+profile: rate 1/2, **100-bit** soundness. At the conservative `Secure` profile
+(**120-bit**, unique decoding) prover throughput is essentially unchanged on the
+same machine — BLAKE3 **1,874/s**, SHA-256 **971/s** — only the proof grows,
+to 558 KiB (BLAKE3) / 605 KiB (SHA-256). Select it with a `secure` argument:
+`cargo run --release --example xmss_sound_throughput -- 390 6 blake3 secure`.
+State the security level when comparing against other systems.
+
 ## How it works
 
 ![Flock proves each hash box; the glue proves the arrows that connect them into a signature](docs/how-it-works.svg)
