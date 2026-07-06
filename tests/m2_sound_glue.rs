@@ -3,7 +3,7 @@
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
-use flock_xmss::backend::{Backend, Sha256Backend};
+use flock_xmss::backend::Sha256Backend;
 use flock_xmss::glue::{prove_sound, prove_sound_raw, verify_sound};
 use flock_xmss::native::{encode_message, keygen, sign, Rng, Signature};
 use flock_xmss::params::{COMPRESSIONS_PER_SIG, TREE_HEIGHT, V_CHAINS};
@@ -26,9 +26,9 @@ fn honest_sound_proof_verifies() {
     let (sigs, msgs, roots, bits) = fixtures(k);
     let setup = Sha256HybridSetup::new(k * COMPRESSIONS_PER_SIG);
     let mut chp = FsChallenger::new(b"flock-xmss-sound");
-    let proof = prove_sound(&setup, &sigs, &msgs, &mut chp);
+    let proof = prove_sound::<Sha256Backend, _>(&setup, &sigs, &msgs, &mut chp);
     let mut chv = FsChallenger::new(b"flock-xmss-sound");
-    verify_sound(&setup, &proof, &msgs, &roots, &bits, &mut chv).expect("honest must verify");
+    verify_sound::<Sha256Backend, _>(&setup, &proof, &msgs, &roots, &bits, &mut chv).expect("honest must verify");
 }
 
 #[test]
@@ -38,12 +38,12 @@ fn wrong_message_rejected() {
     let (sigs, msgs, roots, bits) = fixtures(k);
     let setup = Sha256HybridSetup::new(k * COMPRESSIONS_PER_SIG);
     let mut chp = FsChallenger::new(b"flock-xmss-sound");
-    let proof = prove_sound(&setup, &sigs, &msgs, &mut chp);
+    let proof = prove_sound::<Sha256Backend, _>(&setup, &sigs, &msgs, &mut chp);
     let mut wrong = msgs.clone();
     wrong[1] = Rng(0xEEEE).digest();
     let mut chv = FsChallenger::new(b"flock-xmss-sound");
     assert!(
-        verify_sound(&setup, &proof, &wrong, &roots, &bits, &mut chv).is_err(),
+        verify_sound::<Sha256Backend, _>(&setup, &proof, &wrong, &roots, &bits, &mut chv).is_err(),
         "aggregate MUST be bound to the messages"
     );
 }
@@ -54,10 +54,10 @@ fn wrong_root_rejected() {
     let (sigs, msgs, mut roots, bits) = fixtures(k);
     let setup = Sha256HybridSetup::new(k * COMPRESSIONS_PER_SIG);
     let mut chp = FsChallenger::new(b"flock-xmss-sound");
-    let proof = prove_sound(&setup, &sigs, &msgs, &mut chp);
+    let proof = prove_sound::<Sha256Backend, _>(&setup, &sigs, &msgs, &mut chp);
     roots[2][0] ^= 1;
     let mut chv = FsChallenger::new(b"flock-xmss-sound");
-    assert!(verify_sound(&setup, &proof, &msgs, &roots, &bits, &mut chv).is_err());
+    assert!(verify_sound::<Sha256Backend, _>(&setup, &proof, &msgs, &roots, &bits, &mut chv).is_err());
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn forged_chain_link_rejected() {
     }
     instances[5].1[0] ^= 1;
     let mut chp = FsChallenger::new(b"flock-xmss-sound");
-    let proof = prove_sound_raw(&setup, instances, &steps, &roots, &bits, false, &mut chp);
+    let proof = prove_sound_raw::<Sha256Backend, _>(&setup, instances, &steps, &roots, &bits, false, &mut chp);
     let mut chv = FsChallenger::new(b"flock-xmss-sound");
-    assert!(verify_sound(&setup, &proof, &msgs, &roots, &bits, &mut chv).is_err());
+    assert!(verify_sound::<Sha256Backend, _>(&setup, &proof, &msgs, &roots, &bits, &mut chv).is_err());
 }

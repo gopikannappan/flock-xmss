@@ -1,67 +1,53 @@
-//! Linkage glue (milestone 1b step 2): makes the aggregate proof SOUND by
-//! enforcing the wiring between compression instances.
+//! Linkage glue (the "wiring sumcheck") that makes the aggregate proof SOUND,
+//! generic over the hash backend.
 //!
-//! Design ("wiring sumcheck"): after the base R1CS proof, each instance's four
-//! 256-bit slots (H, OUT, LO, HI) are folded to per-instance scalars at a
-//! verifier point tau_pos (reusing flock's `ChainFold`). Every wiring
-//! constraint from `witness::Wire` becomes a scalar equation:
+//! After the base R1CS proof, each instance's 256-bit slots (H, OUT, LO, HI,
+//! and for BLAKE3 a DOMAIN slot) are folded to per-instance scalars at a
+//! verifier point tau_pos (flock's `ChainFold`). Every wiring constraint from
+//! `witness::Wire` becomes a scalar equation:
 //!
-//!   Link:  G[sx][i] + G[sy][j]        = 0   (char 2: equality)
-//!   Pin:   G[sx][i] + fold(constant)  = 0   (IV, CHAIN_PAD)
-//!   Root:  G[OUT][last_i] + fold(root) = 0  (public per-signature roots)
+//!   Link:  G[sx][i] + G[sy][j]         = 0   (char 2: equality)
+//!   Pin:   G[sx][i] + fold(constant)   = 0   (IV, CHAIN_PAD, BLAKE3 domain)
+//!   Root:  G[OUT][last_i] + fold(root) = 0   (public per-signature roots)
 //!
-//! The verifier samples one scalar rho; all equations combine with geometric
-//! coefficients rho^e into ONE claim  sum_{s,i} W[s][i]*G[s][i] = RHS, where W
-//! is a public weight table and RHS collects the constant/root terms. A
-//! degree-2 paired-fold sumcheck over the (slot, instance) cube reduces this
-//! to a single MLE evaluation of the committed witness, which joins the
-//! batched PCS opening (BaseFold mixed path, as in `prove_chain_generic`).
+//! One scalar rho combines all equations (geometric coefficients) into a single
+//! claim sum_{s,i} W[s][i]*G[s][i] = RHS; a degree-2 paired-fold sumcheck over
+//! the (slot, instance) cube reduces it to one MLE evaluation of the committed
+//! witness, joined to the batched Ligerito PCS opening.
 //!
-//! Soundness: RLC error #equations/|F|; the final claim is bound by the PCS.
-//! The verifier does O(#equations) field work to build W and RHS — linear in
-//! batch size with a tiny constant, while proof SIZE stays succinct.
-//!
-//! SHA-256 backend only: its witness has four aligned 256-bit slots at bytes
-//! 0/32/64/96 (H_in, H_out, M_lo, M_hi). BLAKE3's M region starts at bit 513
-//! (not slot-aligned) and needs a bit-offset fold — future work.
+//! Both hashes use a slot-aligned witness layout (SHA upstream; BLAKE3 via the
+//! aligned-layout fork), so the four core slots sit at bytes 0/32/64/96. BLAKE3
+//! additionally pins a domain slot (counter/block_len/flags) to its constant.
 
 use flock_prover::challenger::Challenger;
 use flock_prover::field::F128;
 use flock_prover::lincheck::QuirkyPoint;
 use flock_prover::pcs::Commitment;
 use flock_prover::r1cs_hashes::chain_common::{fold_in_out, ChainFold, ChainLayout};
-use flock_prover::r1cs_hashes::sha2::{
-    cv_to_phys_bits, generate_witness_with_ab_packed_and_lincheck, Sha256HybridSetup, SHA256_IV,
-};
 
-use crate::backend::{Digest, Sha256Backend};
+use crate::backend::{Backend, Digest};
 use crate::native::{Signature, CHAIN_PAD};
 use crate::params::*;
 use crate::witness::build_sig_witness;
 
-const N_SLOTS_LOG: usize = 2; // 4 slots: H=0, OUT=1, LO=2, HI=3
 const SLOT_H: usize = 0;
 const SLOT_OUT: usize = 1;
 const SLOT_LO: usize = 2;
 const SLOT_HI: usize = 3;
-/// Placeholder slot for path links; resolved by the public path bit.
+const SLOT_DOMAIN: usize = 4;
 const SLOT_BY_PATH_BIT: usize = usize::MAX;
 
-/// SHA-256 slot geometry as two flock ChainLayouts (reusing their fold math).
-fn layout_pair(k_log: usize) -> (ChainLayout, ChainLayout) {
-    let mk = |in_off: usize, out_off: usize| ChainLayout {
+fn layout(k_log: usize, in_off: usize, out_off: usize) -> ChainLayout {
+    ChainLayout {
         k_log,
         k_skip: 6,
         region_log: 8,
         region_bits: 256,
         input_byte_off: in_off,
         output_byte_off: out_off,
-    };
-    (mk(0, 32), mk(64, 96)) // (H, OUT), (LO, HI)
+    }
 }
 
-/// `x_outer_full` from a QuirkyPoint (inline of flock's pub(crate) helper:
-/// concat x_inner_rest ++ x_outer).
 fn x_outer_full(p: &QuirkyPoint) -> Vec<F128> {
     let mut v = Vec::with_capacity(p.x_inner_rest.len() + p.x_outer.len());
     v.extend_from_slice(&p.x_inner_rest);
@@ -76,13 +62,13 @@ fn x_outer_full(p: &QuirkyPoint) -> Vec<F128> {
 #[derive(Clone, Copy)]
 enum Eq {
     Link { xs: usize, xi: usize, ys: usize, yi: usize },
-    Pin { xs: usize, xi: usize, konst: usize }, // 0 = IV, 1 = CHAIN_PAD
+    Pin { xs: usize, xi: usize, konst: usize }, // 0=IV, 1=CHAIN_PAD, 2=DOMAIN
     Root { xi: usize, sig: usize },
 }
 
-/// Deterministic wiring for K signatures, driven by the message-derived
-/// per-chain step counts (mirrors witness::build_sig_witness).
-fn wiring(steps_per_sig: &[[usize; V_CHAINS]]) -> Vec<Eq> {
+/// Deterministic wiring for K signatures, driven by message-derived per-chain
+/// step counts. `has_domain` adds a per-compression domain-slot pin (BLAKE3).
+fn wiring(steps_per_sig: &[[usize; V_CHAINS]], has_domain: bool) -> Vec<Eq> {
     let mut eqs = Vec::new();
     for (sig, steps) in steps_per_sig.iter().enumerate() {
         let base = sig * COMPRESSIONS_PER_SIG;
@@ -120,22 +106,28 @@ fn wiring(steps_per_sig: &[[usize; V_CHAINS]]) -> Vec<Eq> {
         }
         eqs.push(Eq::Root { xi: idx - 1, sig });
     }
+    if has_domain {
+        for xi in 0..(steps_per_sig.len() * COMPRESSIONS_PER_SIG) {
+            eqs.push(Eq::Pin { xs: SLOT_DOMAIN, xi, konst: 2 });
+        }
+    }
     eqs
 }
 
-/// Build the weight tables W[4][2^n_log] and the constant RHS. `path_bit`
-/// resolves the placeholder slots from the public per-signature bits.
+#[allow(clippy::too_many_arguments)]
 fn build_w(
     eqs: &[Eq],
     rho: F128,
+    n_slots: usize,
     n_log: usize,
     iv_fold: F128,
     pad_fold: F128,
+    domain_fold: F128,
     root_folds: &[F128],
     path_bit: &dyn Fn(usize, usize) -> bool,
 ) -> (Vec<Vec<F128>>, F128) {
     let n = 1usize << n_log;
-    let mut w = vec![vec![F128::ZERO; n]; 4];
+    let mut w = vec![vec![F128::ZERO; n]; n_slots];
     let mut rhs = F128::ZERO;
     let mut coef = F128::ONE;
     let mut path_lvl = vec![0usize; root_folds.len()];
@@ -151,11 +143,16 @@ fn build_w(
                     xs
                 };
                 w[xs][xi] += coef;
-                w[ys][yi] += coef; // char 2: subtraction == addition
+                w[ys][yi] += coef; // char 2
             }
             Eq::Pin { xs, xi, konst } => {
                 w[xs][xi] += coef;
-                rhs += coef * if konst == 0 { iv_fold } else { pad_fold };
+                rhs += coef
+                    * match konst {
+                        0 => iv_fold,
+                        1 => pad_fold,
+                        _ => domain_fold,
+                    };
             }
             Eq::Root { xi, sig } => {
                 w[SLOT_OUT][xi] += coef;
@@ -168,12 +165,12 @@ fn build_w(
 }
 
 // ---------------------------------------------------------------------------
-// Paired-fold degree-2 sumcheck (explicit tables W, G; LSB-first rounds)
+// Paired-fold degree-2 sumcheck (char 2)
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize)]
 pub struct WiringProof {
-    pub rounds: Vec<(F128, F128)>, // (q(1), q(inf)) per round
+    pub rounds: Vec<(F128, F128)>,
     pub g_at_point: F128,
 }
 
@@ -193,7 +190,7 @@ fn sumcheck_prove<Ch: Challenger>(
             let (w0, w1) = (w[2 * j], w[2 * j + 1]);
             let (g0, g1) = (g[2 * j], g[2 * j + 1]);
             q1 += w1 * g1;
-            qi += (w1 + w0) * (g1 + g0); // char 2 differences
+            qi += (w1 + w0) * (g1 + g0);
         }
         ch.observe_f128(q1);
         ch.observe_f128(qi);
@@ -218,7 +215,6 @@ fn sumcheck_verify<Ch: Challenger>(
     let mut c = claim;
     let mut point = Vec::with_capacity(proof.rounds.len());
     for &(q1, qi) in &proof.rounds {
-        // q(X) = qi*X^2 + b*X + q0 with q0 = c + q1 (q(0)+q(1) = c in char 2).
         let q0 = c + q1;
         let b = q1 + q0 + qi;
         ch.observe_f128(q1);
@@ -230,7 +226,6 @@ fn sumcheck_verify<Ch: Challenger>(
     (point, c)
 }
 
-/// MLE of an explicit table at `point` (LSB-first) by in-place folding.
 fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
     let mut t = table.to_vec();
     for r in point {
@@ -244,7 +239,7 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 }
 
 // ---------------------------------------------------------------------------
-// Sound aggregation (SHA-256, BaseFold mixed opening)
+// Sound aggregation (generic over backend)
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize)]
@@ -257,86 +252,106 @@ pub struct SoundAggregateProof {
     pub n_signatures: usize,
 }
 
-/// Prove K signature verifications with full wiring enforcement.
-/// Statement: (roots, path_bits) per signature; signatures are witness.
-pub fn prove_sound<Ch: Challenger>(
-    setup: &Sha256HybridSetup,
+pub fn prove_sound<B: Backend, Ch: Challenger>(
+    setup: &B::Setup,
     sigs: &[Signature],
     msgs: &[Digest],
     ch: &mut Ch,
 ) -> SoundAggregateProof {
     assert_eq!(sigs.len(), msgs.len());
-    let steps: Vec<[usize; V_CHAINS]> = msgs
-        .iter()
-        .map(|m| crate::native::encode_message::<Sha256Backend>(m).0)
-        .collect();
+    let steps: Vec<[usize; V_CHAINS]> =
+        msgs.iter().map(|m| crate::native::encode_message::<B>(m).0).collect();
     let mut instances = Vec::with_capacity(sigs.len() * COMPRESSIONS_PER_SIG);
     let mut roots = Vec::with_capacity(sigs.len());
     for (sig, st) in sigs.iter().zip(&steps) {
-        let w = build_sig_witness::<Sha256Backend>(sig, st);
+        let w = build_sig_witness::<B>(sig, st);
         roots.push(w.computed_root);
         instances.extend(w.instances);
     }
     let bits: Vec<[bool; TREE_HEIGHT]> = sigs.iter().map(|s| s.path_bits).collect();
-    prove_sound_raw(setup, instances, &steps, &roots, &bits, true, ch)
+    prove_sound_raw::<B, Ch>(setup, instances, &steps, &roots, &bits, true, ch)
 }
 
-/// Raw prover over pre-built instances. `check_identity=false` lets tests
-/// forge inconsistent witnesses to confirm the VERIFIER catches them.
+/// Raw prover. `check_identity=false` lets tests forge witnesses to confirm the
+/// verifier rejects them.
 #[doc(hidden)]
-pub fn prove_sound_raw<Ch: Challenger>(
-    setup: &Sha256HybridSetup,
-    instances: Vec<([u32; 8], [u32; 16])>,
+#[allow(clippy::too_many_arguments)]
+pub fn prove_sound_raw<B: Backend, Ch: Challenger>(
+    setup: &B::Setup,
+    instances: Vec<B::Instance>,
     steps_per_sig: &[[usize; V_CHAINS]],
     roots: &[Digest],
     path_bits: &[[bool; TREE_HEIGHT]],
     check_identity: bool,
     ch: &mut Ch,
 ) -> SoundAggregateProof {
-    let k_sigs = roots.len();
-    let k_log = setup.r1cs.k_log;
-    let n_log = setup.r1cs.m - k_log;
+    let k_log = B::k_log(setup);
+    let n_log = B::m(setup) - k_log;
+    let r1cs = B::r1cs(setup);
+    let pcs_params = B::pcs_params(setup);
 
-    let (z_packed, a_packed, b_packed, z_lc) =
-        generate_witness_with_ab_packed_and_lincheck(&instances, n_log);
+    let (z_packed, a_packed, b_packed, z_lc) = B::gen_witness_ab(&instances, n_log);
     let core = flock_prover::prover::prove_fast_core(
-        &setup.r1cs,
-        &setup.pcs_params,
+        r1cs,
+        pcs_params,
         z_packed,
         a_packed,
         b_packed,
         z_lc,
-        setup.r1cs.csc_lincheck_circuit(),
+        r1cs.csc_lincheck_circuit(),
         ch,
     );
 
-    // Region folds at tau_pos.
-    let (lay_a, lay_b) = layout_pair(k_log);
+    let off = B::slot_byte_offsets();
+    let lay_a = layout(k_log, off[0], off[1]);
     let tau_pos = ch.sample_f128_vec(lay_a.tau_pos_len());
     let fold_a = ChainFold::new(&lay_a, tau_pos.clone());
-    let fold_b = ChainFold::new(&lay_b, tau_pos.clone());
-    let (g_h, g_out) = fold_in_out(&lay_a, setup.r1cs.layout, &core.z_packed, &fold_a);
-    let (g_lo, g_hi) = fold_in_out(&lay_b, setup.r1cs.layout, &core.z_packed, &fold_b);
 
-    // Wiring RLC.
+    let n_slots = 1usize << B::N_SLOTS_LOG;
+    let domain = B::domain_slot();
+    // The packed-direct claim opens `z_packed` over the WHOLE 2^N_SLOTS_LOG slot
+    // cube. So `g_flat` must faithfully fold z_packed at EVERY region s (byte
+    // s*32), not just the wiring slots — otherwise the padding slots (which hold
+    // real, nonzero witness data, e.g. BLAKE3's g-function region 5) make the
+    // committed MLE disagree with `g_at_point`. Padding slots keep w=0, so the
+    // sumcheck claim and rhs are unchanged; only the opened value is corrected.
+    let g_store: Vec<Vec<F128>> = (0..n_slots)
+        .map(|s| {
+            let byte = s * 32;
+            let lay = layout(k_log, byte, byte);
+            let fold = ChainFold::new(&lay, tau_pos.clone());
+            fold_in_out(&lay, r1cs.layout, &core.z_packed, &fold).0
+        })
+        .collect();
+    let gs: Vec<&[F128]> = g_store.iter().map(|v| v.as_slice()).collect();
+
     let rho = ch.sample_f128();
-    let iv_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&SHA256_IV));
-    let pad_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&CHAIN_PAD));
-    let root_folds: Vec<F128> =
-        roots.iter().map(|r| fold_a.fold_public_phys(&cv_to_phys_bits(r))).collect();
-    let eqs = wiring(steps_per_sig);
-    let pb = |sig: usize, lvl: usize| path_bits[sig][lvl];
-    let (w4, rhs) = build_w(&eqs, rho, n_log, iv_fold, pad_fold, &root_folds, &pb);
+    let iv_fold = fold_a.fold_public_phys(&B::digest_to_phys_bits(&B::iv()));
+    let pad_fold = fold_a.fold_public_phys(&B::digest_to_phys_bits(&CHAIN_PAD));
+    let domain_fold = domain
+        .as_ref()
+        .map(|(_, _, phys)| fold_a.fold_public_phys(phys))
+        .unwrap_or(F128::ZERO);
+    let root_folds: Vec<F128> = roots
+        .iter()
+        .map(|r| fold_a.fold_public_phys(&B::digest_to_phys_bits(r)))
+        .collect();
 
-    // Interleave to flat tables over idx = (i << 2) | slot.
+    let eqs = wiring(steps_per_sig, domain.is_some());
+    let pb = |sig: usize, lvl: usize| path_bits[sig][lvl];
+    let (w_slots, rhs) = build_w(
+        &eqs, rho, n_slots, n_log, iv_fold, pad_fold, domain_fold, &root_folds, &pb,
+    );
+
     let n = 1usize << n_log;
-    let mut w_flat = vec![F128::ZERO; 4 * n];
-    let mut g_flat = vec![F128::ZERO; 4 * n];
-    let gs = [&g_h, &g_out, &g_lo, &g_hi];
+    let mut w_flat = vec![F128::ZERO; n_slots * n];
+    let mut g_flat = vec![F128::ZERO; n_slots * n];
     for i in 0..n {
-        for s in 0..4 {
-            w_flat[(i << N_SLOTS_LOG) | s] = w4[s][i];
-            g_flat[(i << N_SLOTS_LOG) | s] = gs[s][i];
+        for s in 0..n_slots {
+            w_flat[(i << B::N_SLOTS_LOG) | s] = w_slots[s][i];
+            if s < gs.len() {
+                g_flat[(i << B::N_SLOTS_LOG) | s] = gs[s][i];
+            }
         }
     }
     if check_identity {
@@ -345,13 +360,12 @@ pub fn prove_sound_raw<Ch: Challenger>(
             .zip(&g_flat)
             .map(|(a, b)| *a * *b)
             .fold(F128::ZERO, |x, y| x + y);
-        assert_eq!(total, rhs, "wiring identity violated — witness/wiring mismatch");
+        assert_eq!(total, rhs, "wiring identity violated");
     }
 
     let (wiring_proof, point) = sumcheck_prove(w_flat, g_flat, ch);
 
-    // Extra claim into the batched open.
-    let claim_pt = claim_point(&tau_pos, &point, k_log);
+    let claim_pt = claim_point(&tau_pos, &point, k_log, B::N_SLOTS_LOG);
     let sparse_eq = flock_prover::pcs::ring_switch::build_eq_sparse(&claim_pt);
     let extra = flock_prover::pcs::PackedDirectClaim {
         point: claim_pt,
@@ -359,16 +373,16 @@ pub fn prove_sound_raw<Ch: Challenger>(
         eq_ind: flock_prover::pcs::DirectEqInd::Sparse(sparse_eq),
     };
 
-    let padding = setup.r1cs.padding_spec();
+    let padding = r1cs.padding_spec();
     let ab_x = x_outer_full(&core.ab.point);
     let c_x = x_outer_full(&core.c.point);
     let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
-    let log_n = setup.r1cs.m - flock_prover::pcs::LOG_PACKING;
+    let log_n = B::m(setup) - flock_prover::pcs::LOG_PACKING;
     let lig_config = flock_prover::pcs::ligerito::prover_config_for(
         log_n,
-        setup.pcs_params.log_batch_size,
-        setup.pcs_params.profile,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
     )
     .expect("ligerito prover config");
     let pcs_open = flock_prover::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
@@ -389,13 +403,12 @@ pub fn prove_sound_raw<Ch: Challenger>(
         wiring: wiring_proof,
         pcs_open,
         commitment: core.commitment,
-        n_signatures: k_sigs,
+        n_signatures: roots.len(),
     }
 }
 
-/// Verify against the public statement (roots, path_bits).
-pub fn verify_sound<Ch: Challenger>(
-    setup: &Sha256HybridSetup,
+pub fn verify_sound<B: Backend, Ch: Challenger>(
+    setup: &B::Setup,
     proof: &SoundAggregateProof,
     msgs: &[Digest],
     roots: &[Digest],
@@ -406,63 +419,73 @@ pub fn verify_sound<Ch: Challenger>(
     if msgs.len() != k_sigs || roots.len() != k_sigs || path_bits.len() != k_sigs {
         return Err("statement length mismatch".into());
     }
-    // Derive per-chain step counts from the PUBLIC messages — this is what
-    // binds the aggregate to the messages: wrong message => wrong wiring.
-    let steps: Vec<[usize; V_CHAINS]> = msgs
-        .iter()
-        .map(|m| crate::native::encode_message::<Sha256Backend>(m).0)
-        .collect();
+    let steps: Vec<[usize; V_CHAINS]> =
+        msgs.iter().map(|m| crate::native::encode_message::<B>(m).0).collect();
+
+    let r1cs = B::r1cs(setup);
     let (ab, c) = flock_prover::verifier::verify_core(
-        &setup.r1cs,
+        r1cs,
         &proof.zerocheck,
         &proof.lincheck,
         &proof.commitment,
-        setup.r1cs.csc_lincheck_circuit(),
+        r1cs.csc_lincheck_circuit(),
         ch,
     )
     .map_err(|e| format!("core: {e:?}"))?;
 
-    let k_log = setup.r1cs.k_log;
-    let n_log = setup.r1cs.m - k_log;
-    let (lay_a, _) = layout_pair(k_log);
+    let k_log = B::k_log(setup);
+    let n_log = B::m(setup) - k_log;
+    let off = B::slot_byte_offsets();
+    let lay_a = layout(k_log, off[0], off[1]);
     let tau_pos = ch.sample_f128_vec(lay_a.tau_pos_len());
     let fold_a = ChainFold::new(&lay_a, tau_pos.clone());
+    let domain = B::domain_slot();
+    let n_slots = 1usize << B::N_SLOTS_LOG;
 
     let rho = ch.sample_f128();
-    let iv_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&SHA256_IV));
-    let pad_fold = fold_a.fold_public_phys(&cv_to_phys_bits(&CHAIN_PAD));
-    let root_folds: Vec<F128> =
-        roots.iter().map(|r| fold_a.fold_public_phys(&cv_to_phys_bits(r))).collect();
-    let eqs = wiring(&steps);
+    let iv_fold = fold_a.fold_public_phys(&B::digest_to_phys_bits(&B::iv()));
+    let pad_fold = fold_a.fold_public_phys(&B::digest_to_phys_bits(&CHAIN_PAD));
+    let domain_fold = domain
+        .as_ref()
+        .map(|(_, _, phys)| fold_a.fold_public_phys(phys))
+        .unwrap_or(F128::ZERO);
+    let root_folds: Vec<F128> = roots
+        .iter()
+        .map(|r| fold_a.fold_public_phys(&B::digest_to_phys_bits(r)))
+        .collect();
+
+    let eqs = wiring(&steps, domain.is_some());
     let pb = |sig: usize, lvl: usize| path_bits[sig][lvl];
-    let (w4, rhs) = build_w(&eqs, rho, n_log, iv_fold, pad_fold, &root_folds, &pb);
+    let (w_slots, rhs) = build_w(
+        &eqs, rho, n_slots, n_log, iv_fold, pad_fold, domain_fold, &root_folds, &pb,
+    );
 
     let (point, c_final) = sumcheck_verify(&proof.wiring, rhs, ch);
 
     let n = 1usize << n_log;
-    let mut w_flat = vec![F128::ZERO; 4 * n];
+    let mut w_flat = vec![F128::ZERO; n_slots * n];
     for i in 0..n {
-        for s in 0..4 {
-            w_flat[(i << N_SLOTS_LOG) | s] = w4[s][i];
+        for s in 0..n_slots {
+            w_flat[(i << B::N_SLOTS_LOG) | s] = w_slots[s][i];
         }
     }
-    let w_at = mle_eval(&w_flat, &point);
-    if c_final != w_at * proof.wiring.g_at_point {
+    if c_final != mle_eval(&w_flat, &point) * proof.wiring.g_at_point {
         return Err("wiring sumcheck final identity failed".into());
     }
 
-    let claim_pt = claim_point(&tau_pos, &point, k_log);
+    let claim_pt = claim_point(&tau_pos, &point, k_log, B::N_SLOTS_LOG);
     let ab_x = x_outer_full(&ab.point);
     let c_x = x_outer_full(&c.point);
     let pd = flock_prover::pcs::PackedDirectClaimRef {
         point: &claim_pt,
         value: proof.wiring.g_at_point,
     };
-    let log_n = setup.r1cs.m - flock_prover::pcs::LOG_PACKING;
+    let log_n = B::m(setup) - flock_prover::pcs::LOG_PACKING;
+    let pcs_params = B::pcs_params(setup);
     let v_config = flock_prover::pcs::ligerito::verifier_config_for(
         log_n,
-        setup.pcs_params.log_batch_size,
-        setup.pcs_params.profile,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
     )
     .expect("ligerito verifier config");
     flock_prover::pcs::verify_opening_batch_ligerito_mixed(
@@ -478,12 +501,10 @@ pub fn verify_sound<Ch: Challenger>(
     .map_err(|e| format!("pcs: {e:?}"))
 }
 
-/// Claim point (RowMajor): [tau_pos.., slot0, slot1, 0^high, instance..].
-/// Within a block, word index = (slot << 1) | pos_word; the sumcheck bound
-/// idx = (i << 2) | slot LSB-first, so its first 2 coords are the slot bits.
-fn claim_point(tau_pos: &[F128], sc_point: &[F128], k_log: usize) -> Vec<F128> {
-    let (slot_bits, inst_bits) = sc_point.split_at(N_SLOTS_LOG);
-    let high = k_log - flock_prover::pcs::LOG_PACKING - tau_pos.len() - N_SLOTS_LOG;
+/// Claim point (RowMajor): [tau_pos.., slot_bits.., 0^high, instance..].
+fn claim_point(tau_pos: &[F128], sc_point: &[F128], k_log: usize, n_slots_log: usize) -> Vec<F128> {
+    let (slot_bits, inst_bits) = sc_point.split_at(n_slots_log);
+    let high = k_log - flock_prover::pcs::LOG_PACKING - tau_pos.len() - n_slots_log;
     let mut pt = Vec::new();
     pt.extend_from_slice(tau_pos);
     pt.extend_from_slice(slot_bits);

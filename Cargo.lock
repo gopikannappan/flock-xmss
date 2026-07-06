@@ -152,7 +152,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "flock-core"
 version = "0.1.0"
-source = "git+https://github.com/succinctlabs/flock?rev=4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a#4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a"
+source = "git+https://github.com/gopikannappan/flock?rev=16e4ca7320b9104d0a4f5321b55040bd0bcc9d6a#16e4ca7320b9104d0a4f5321b55040bd0bcc9d6a"
 dependencies = [
  "bincode",
  "blake3",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "flock-prover"
 version = "0.1.0"
-source = "git+https://github.com/succinctlabs/flock?rev=4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a#4af7a4da3b60f2ac86ab9aaf2c6a4ff1de416b3a"
+source = "git+https://github.com/gopikannappan/flock?rev=16e4ca7320b9104d0a4f5321b55040bd0bcc9d6a#16e4ca7320b9104d0a4f5321b55040bd0bcc9d6a"
 dependencies = [
  "bincode",
  "blake3",

@@ -41,7 +41,7 @@ pub fn build_sig_witness<B: Backend>(sig: &Signature, steps: &[usize; V_CHAINS])
     let mut wires: Vec<Wire> = Vec::with_capacity(COMPRESSIONS_PER_SIG);
     let iv = B::iv();
 
-    let mut push = |triples: &mut Vec<Triple>, h: Digest, lo: Digest, hi: Digest| -> Digest {
+    let push = |triples: &mut Vec<Triple>, h: Digest, lo: Digest, hi: Digest| -> Digest {
         triples.push((h, lo, hi));
         B::compress(&h, &lo, &hi)
     };
