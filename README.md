@@ -7,7 +7,8 @@ Post-quantum Ethereum needs to aggregate thousands of hash-based signatures into
 one SNARK proof per slot. The current leanSig stack does this with Poseidon, an
 algebraic hash chosen because it was assumed cheaper to prove. This repo is the
 counter-example: an aggregator for the same signature shape using hashes with
-decades of cryptanalysis behind them, and it is faster.
+decades of cryptanalysis behind them. On the same machine, with comparable
+parameters, it aggregates more signatures per second (numbers below).
 
 ## Numbers (Apple M4 Mac mini, base model, same machine for both systems)
 
@@ -24,6 +25,32 @@ of that is re-deriving message encodings through a software hash; a hardware
 encoder cuts it to roughly 2 ms). The soundness glue costs 2.0% of prover time
 for SHA-256 and 6.9% for BLAKE3 (v0 vs sound, same machine, same session:
 982 -> 962 and 1,987 -> 1,849).
+
+## How it works
+
+A signature is a chain of hashes leading to one public root: Winternitz chains,
+a leaf hash, then a Merkle path. **Flock proves each hash is computed correctly.**
+On its own, Flock's batch proof does not force those hashes to connect into one
+signature. **This repo adds the wiring that ties them together and binds them to
+the public inputs**, as one extra sumcheck on top of Flock's proof.
+
+The mechanism:
+
+1. Each compression exposes its input, output, and message as fixed 256-bit
+   slots. Using Flock's own fold, each slot is folded to a single field element.
+2. Every wiring rule becomes a simple equation over those elements:
+   output of step *i* = input of step *i+1*; the last output = the public root;
+   the IV, the padding block, and (BLAKE3) the domain are pinned to constants.
+3. All equations are combined by a random linear combination into one claim and
+   proved with a single degree-2 sumcheck. Its final evaluation is discharged as
+   one extra opening point on Flock's *existing* batched PCS opening, so there is
+   no second commitment. That is why the glue costs only ~2% (SHA-256) / ~7%
+   (BLAKE3) of prover time.
+
+The chain lengths are derived from the message (target-sum encoding, the leanSig
+aborting pattern), so the aggregate is bound to the actual messages. The wiring
+lives in `src/glue.rs`; the soundness claims are checked adversarially in
+`tests/`.
 
 ## What the proof enforces
 
@@ -68,9 +95,12 @@ Research prototype, not production code.
 2. Chain step positions are message-derived via target-sum rejection sampling
    (the leanSig aborting-encoding pattern), and the aggregate is bound to the
    messages: verifying against a wrong message fails (tested).
-3. Parameters mirror leanSig's w2 instantiation shape with 256-bit digests.
-4. Numbers are CPU-only on a base M4 Mac mini (4P+6E); an M4 Max (10 P-cores)
-   scales further, as leanVM's own ~2x M4-Max/M4-S ratio shows.
+3. Parameters mirror leanSig's w2 instantiation shape with 256-bit digests, so
+   treat this as a comparable-shape result on one machine, not a formal
+   apples-to-apples comparison. Raw rates are given so any parameterization can
+   be recomputed.
+4. Numbers are CPU-only on a base M4 Mac mini (4P+6E), best of 6, single session.
+   Only tested on M4-S, not M4 Max.
 
 ## Credits
 
