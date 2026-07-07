@@ -34,6 +34,34 @@ to 558 KiB (BLAKE3) / 605 KiB (SHA-256). Select it with a `secure` argument:
 `cargo run --release --example xmss_sound_throughput -- 390 6 blake3 secure`.
 State the security level when comparing against other systems.
 
+## Control-flow hiding + membership (experimental)
+
+The aggregator above reads the Merkle path from public input, which exposes
+control flow. An **experimental** variant hides it: the path becomes a *private*
+witness, and the verifier receives only `{roots, messages}` (or, with membership,
+`{V, messages}`). The chain — the running hash is one of the two children at each
+level — is enforced by a product zerocheck bound to the commitment, not a public
+bit. A `membership` mode further proves each signer's key is a leaf of one
+committed validator-set root `V`, so K public roots collapse to one.
+
+| variant | entry points | M4-S, 120-bit, K=390 |
+|---|---|---:|
+| control-flow hidden | `glue_hidden::prove_sound_hidden` | 1,787/s, 559 KiB |
+| + membership (single `V`) | `glue_hidden::prove_sound_membership` | 1,750/s, 559 KiB |
+
+Costs ~5% over the base. Tested adversarially (tampered opening rejected by the
+PCS binding; broken chain rejected by the zerocheck; wrong `V` rejected).
+
+> ⚠️ **This variant is a research prototype: novel, hand-rolled sumchecks + PCS
+> wiring, self-tested, NOT reviewed.** It is a candidate, not a proof. The base
+> aggregator (above) is the more-tested path. See `src/glue_hidden.rs`,
+> `src/hiding.rs`, and the `m3_*`/`m2_membership_e2e` tests.
+
+```sh
+cargo run --release --example xmss_sound_throughput -- 390 6 blake3 secure hidden
+cargo run --release --example xmss_sound_throughput -- 390 6 blake3 secure mem
+```
+
 ## How it works
 
 ![Flock proves each hash box; the glue proves the arrows that connect them into a signature](docs/how-it-works.svg)

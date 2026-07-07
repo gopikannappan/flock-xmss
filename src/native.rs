@@ -30,6 +30,93 @@ pub fn leaf_hash<B: Backend>(tops: &[Digest; V_CHAINS]) -> Digest {
     acc
 }
 
+/// Recompute a signature's XMSS leaf (the value the Merkle/membership path rises
+/// from): walk each revealed chain to its top, then Merkle–Damgård the tops.
+/// Matches `witness::build_sig_witness`'s chain+leaf section exactly.
+pub fn compute_leaf<B: Backend>(sig: &Signature, steps: &[usize; V_CHAINS]) -> Digest {
+    let mut tops = [[0u32; 8]; V_CHAINS];
+    for c in 0..V_CHAINS {
+        let mut x = sig.chain_values[c];
+        for _ in 0..steps[c] {
+            x = chain_step::<B>(&x);
+        }
+        tops[c] = x;
+    }
+    leaf_hash::<B>(&tops)
+}
+
+/// Fixed padding leaf for empty validator-tree slots.
+pub const VSET_PAD: Digest = [0xEEEE_EEEE; 8];
+
+/// Build a height-`TREE_HEIGHT` validator-set Merkle tree over `leaves` (padded
+/// with `VSET_PAD`), returning the root `V` and each leaf's authentication path
+/// (siblings + path bits). Active-prefix build: O(leaves · TREE_HEIGHT), not
+/// O(2^TREE_HEIGHT).
+#[allow(clippy::type_complexity)]
+pub fn build_validator_set<B: Backend>(
+    leaves: &[Digest],
+) -> (Digest, Vec<([Digest; TREE_HEIGHT], [bool; TREE_HEIGHT])>) {
+    assert!(leaves.len() <= (1usize << TREE_HEIGHT), "too many validators");
+    // Padding-subtree root at each level.
+    let mut pads = [VSET_PAD; TREE_HEIGHT + 1];
+    for l in 1..=TREE_HEIGHT {
+        pads[l] = node_hash::<B>(&pads[l - 1], &pads[l - 1]);
+    }
+    // Materialize only the non-padding prefix at each level.
+    let mut levels: Vec<Vec<Digest>> = vec![leaves.to_vec()];
+    for l in 0..TREE_HEIGHT {
+        let prev = &levels[l];
+        let mut next = Vec::with_capacity(prev.len().div_ceil(2));
+        let mut j = 0;
+        while j < prev.len() {
+            let lft = prev[j];
+            let rgt = if j + 1 < prev.len() { prev[j + 1] } else { pads[l] };
+            next.push(node_hash::<B>(&lft, &rgt));
+            j += 2;
+        }
+        levels.push(next);
+    }
+    let v = levels[TREE_HEIGHT].first().copied().unwrap_or(pads[TREE_HEIGHT]);
+    let mut paths = Vec::with_capacity(leaves.len());
+    for i in 0..leaves.len() {
+        let mut ap = [[0u32; 8]; TREE_HEIGHT];
+        let mut pb = [false; TREE_HEIGHT];
+        let mut idx = i;
+        for (l, slot) in ap.iter_mut().enumerate() {
+            let sib = idx ^ 1;
+            *slot = levels[l].get(sib).copied().unwrap_or(pads[l]);
+            pb[l] = idx & 1 == 1; // idx is the right child => sibling on the left
+            idx >>= 1;
+        }
+        paths.push((ap, pb));
+    }
+    (v, paths)
+}
+
+#[cfg(test)]
+mod vset_tests {
+    use super::*;
+    use crate::backend::Blake3Backend;
+
+    #[test]
+    fn auth_paths_recompute_to_v() {
+        let mut rng = Rng(0x5E7);
+        let leaves: Vec<Digest> = (0..390).map(|_| rng.digest()).collect();
+        let (v, paths) = build_validator_set::<Blake3Backend>(&leaves);
+        for (i, (ap, pb)) in paths.iter().enumerate() {
+            let mut node = leaves[i];
+            for lvl in 0..TREE_HEIGHT {
+                node = if pb[lvl] {
+                    node_hash::<Blake3Backend>(&ap[lvl], &node)
+                } else {
+                    node_hash::<Blake3Backend>(&node, &ap[lvl])
+                };
+            }
+            assert_eq!(node, v, "leaf {i} auth path must recompute to V");
+        }
+    }
+}
+
 /// Deterministic test rng (same splitmix64 pattern as flock's benches).
 pub struct Rng(pub u64);
 impl Rng {

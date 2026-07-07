@@ -8,6 +8,8 @@
 pub mod aggregate;
 pub mod backend;
 pub mod glue;
+pub mod hiding;
+pub mod glue_hidden;
 pub mod native;
 pub mod params;
 pub mod witness;
