@@ -73,7 +73,7 @@ fn fold_all(tables: &mut [&mut Vec<F128>], c: F128) {
     }
 }
 
-#[derive(serde::Serialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct HidingProof {
     /// Masked product zerocheck rounds (5 evals each: degree-4 poly).
     pub zc_rounds: Vec<[F128; 5]>,

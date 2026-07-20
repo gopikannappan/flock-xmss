@@ -187,7 +187,7 @@ fn build_w(
 // Paired-fold degree-2 sumcheck (char 2)
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WiringProof {
     pub rounds: Vec<(F128, F128)>,
     pub g_at_point: F128,
@@ -261,7 +261,7 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 // Sound aggregation (generic over backend)
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SoundAggregateProofHidden {
     pub zerocheck: flock_prover::zerocheck::ZerocheckProof,
     pub lincheck: flock_prover::lincheck::LincheckProof,
@@ -406,7 +406,7 @@ pub fn prove_sound_raw_hidden<B: Backend, Ch: Challenger>(
     // on the MAIN transcript so its challenges are Fiat-Shamir bound.
     let n = 1usize << n_log;
     let mask = merkle_mask(steps_per_sig.len(), n);
-    let t_h = std::time::Instant::now();
+    let t_h = crate::ztime::Instant::now();
     let (hiding_proof, hpts) = crate::hiding::prove(
         &g_store[SLOT_OUT],
         &g_store[SLOT_LO],
